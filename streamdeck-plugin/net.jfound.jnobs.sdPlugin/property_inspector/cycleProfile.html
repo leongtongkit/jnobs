@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Cycle Profile</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 12px;
+               color: #FFF; background: #2D2D2D; margin: 0; padding: 14px; }
+        label { display: block; margin: 0 0 4px; color: #B6B6B6; }
+        select { width: 100%; padding: 6px; background: #3D3D3D; color: #FFF;
+                 border: 1px solid #555; border-radius: 4px; font-size: 12px; }
+        .hint { font-size: 11px; color: #888; margin-top: 8px; line-height: 1.4; }
+    </style>
+</head>
+<body>
+    <label for="direction">Direction</label>
+    <select id="direction">
+        <option value="next">Next profile</option>
+        <option value="previous">Previous profile</option>
+    </select>
+    <p class="hint">Cycles through your saved Jnobs profiles.</p>
+    <script>
+        let websocket = null;
+        let context = '';
+        let actionInfo = null;
+        const dirSelect = document.getElementById('direction');
+
+        function connectElgatoStreamDeckSocket(inPort, inUUID, inRegisterEvent, inInfo, inActionInfo) {
+            context = inUUID;
+            actionInfo = JSON.parse(inActionInfo);
+            const current = (actionInfo.payload && actionInfo.payload.settings &&
+                             actionInfo.payload.settings.direction) || 'next';
+            dirSelect.value = current;
+            websocket = new WebSocket('ws://127.0.0.1:' + inPort);
+            websocket.onopen = () => {
+                websocket.send(JSON.stringify({ event: inRegisterEvent, uuid: inUUID }));
+            };
+        }
+
+        dirSelect.addEventListener('change', () => {
+            websocket.send(JSON.stringify({
+                event: 'setSettings',
+                context: context,
+                payload: { direction: dirSelect.value }
+            }));
+        });
+    </script>
+</body>
+</html>

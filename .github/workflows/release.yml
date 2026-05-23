@@ -1,0 +1,111 @@
+name: Release
+
+# Builds, code-signs (Developer ID), notarizes, staples, and publishes
+# Jnobs.app to a GitHub Release whenever a tag matching v* is pushed.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   MACOS_CERTIFICATE        base64-encoded .p12 of the Developer ID Application cert
+#   MACOS_CERTIFICATE_PWD    password for the .p12
+#   MACOS_CI_KEYCHAIN_PWD    any random string (creates a temp keychain in CI)
+#   APPLE_DEVELOPER_ID       full signing identity, e.g.
+#                            "Developer ID Application: Your Name (TEAMID)"
+#   APPLE_ID                 Apple ID email used for notarization submission
+#   APPLE_APP_PWD            app-specific password from appleid.apple.com
+#   APPLE_TEAM_ID            10-character Team ID (visible in your developer account)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write  # to create the GitHub Release
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Import Developer ID certificate into temporary keychain
+        env:
+          MACOS_CERTIFICATE:     ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PWD:          ${{ secrets.MACOS_CI_KEYCHAIN_PWD }}
+        run: |
+          set -euo pipefail
+          echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import /tmp/cert.p12 \
+            -k build.keychain \
+            -P "$MACOS_CERTIFICATE_PWD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PWD" build.keychain
+          rm /tmp/cert.p12
+
+      - name: Build app
+        working-directory: app
+        run: ./build_app.sh --release
+
+      - name: Re-sign with Developer ID + hardened runtime
+        env:
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+        run: |
+          set -euo pipefail
+          APP="app/Jnobs.app"
+          # Build script ad-hoc signs; replace with Developer ID + hardened
+          # runtime + secure timestamp (all required for notarization).
+          codesign --force --deep \
+            --options runtime \
+            --timestamp \
+            --sign "$APPLE_DEVELOPER_ID" \
+            "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+
+      - name: Zip for notarization
+        run: |
+          ditto -c -k --keepParent app/Jnobs.app /tmp/Jnobs.zip
+
+      - name: Submit to Apple notary service
+        env:
+          APPLE_ID:       ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID:  ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PWD:  ${{ secrets.APPLE_APP_PWD }}
+        run: |
+          set -euo pipefail
+          xcrun notarytool submit /tmp/Jnobs.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PWD" \
+            --wait
+
+      - name: Staple notarization ticket
+        run: xcrun stapler staple app/Jnobs.app
+
+      - name: Re-zip stapled app for release
+        run: |
+          rm /tmp/Jnobs.zip
+          ditto -c -k --keepParent app/Jnobs.app /tmp/Jnobs.zip
+
+      - name: Verify Gatekeeper acceptance
+        run: spctl -a -t exec -vv app/Jnobs.app
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF##refs/tags/}"
+          gh release create "$TAG" /tmp/Jnobs.zip \
+            --title "Jnobs $TAG" \
+            --generate-notes \
+            --verify-tag

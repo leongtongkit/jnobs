@@ -1,0 +1,35 @@
+# Swift / Xcode build artifacts
+app/.build/
+app/.swiftpm/
+app/*.xcodeproj/
+app/Jnobs.app/
+*.dSYM/
+
+# macOS
+.DS_Store
+._*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Probe captures (runtime byte-stream logs — not source)
+probe/sniff.log
+probe/round*.txt
+probe/tap_probe
+probe/*.pyc
+probe/__pycache__/
+
+# Local secrets / personal config
+*.local
+config.local.json
+
+# Internal design / planning notes (not user-facing; kept locally only)
+FEASIBILITY_per_app_audio.md
+NOTES.md
+TODO.md
+SCRATCH.md
+CLAUDE.md
+AGENTS.md
+.claude/

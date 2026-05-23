@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Switch Profile</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            font-size: 12px;
+            color: #FFF;
+            background: #2D2D2D;
+            margin: 0; padding: 14px;
+        }
+        label { display: block; margin: 0 0 4px; color: #B6B6B6; }
+        select {
+            width: 100%;
+            padding: 6px;
+            background: #3D3D3D;
+            color: #FFF;
+            border: 1px solid #555;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        .hint  { font-size: 11px; color: #888; margin-top: 8px; line-height: 1.4; }
+        .error { color: #FF8080; font-size: 11px; margin-top: 8px; }
+        .refresh {
+            margin-top: 8px;
+            padding: 4px 10px;
+            background: transparent;
+            color: #00DC5A;
+            border: 1px solid #00DC5A;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .refresh:hover { background: #00DC5A22; }
+    </style>
+</head>
+<body>
+    <label for="profile">Jnobs profile</label>
+    <select id="profile">
+        <option value="">(loading…)</option>
+    </select>
+    <button class="refresh" id="refresh">Refresh list</button>
+    <p class="hint">Press the button to switch Jnobs to this profile. The button highlights when this profile is active.</p>
+    <p class="error" id="error" style="display: none;"></p>
+
+    <script>
+        const JNOBS_URL = 'http://127.0.0.1:49152';
+
+        let websocket = null;
+        let context = '';
+        let actionInfo = null;
+        const profileSelect = document.getElementById('profile');
+        const errorEl = document.getElementById('error');
+
+        function connectElgatoStreamDeckSocket(inPort, inUUID, inRegisterEvent, inInfo, inActionInfo) {
+            context = inUUID;
+            actionInfo = JSON.parse(inActionInfo);
+            websocket = new WebSocket('ws://127.0.0.1:' + inPort);
+            websocket.onopen = () => {
+                websocket.send(JSON.stringify({ event: inRegisterEvent, uuid: inUUID }));
+                fetchProfiles();
+            };
+            websocket.onmessage = (evt) => {
+                try {
+                    const msg = JSON.parse(evt.data);
+                    if (msg.event === 'sendToPropertyInspector' && msg.payload) {
+                        if (msg.payload.profiles) {
+                            populateProfiles(msg.payload.profiles, msg.payload.activeProfile);
+                        } else if (msg.payload.error) {
+                            showError(msg.payload.error);
+                        }
+                    }
+                } catch (e) {}
+            };
+        }
+
+        function fetchProfiles() {
+            errorEl.style.display = 'none';
+            fetch(JNOBS_URL + '/state')
+                .then(r => r.json())
+                .then(state => populateProfiles(state.profiles, state.activeProfile))
+                .catch(e => showError('Could not reach Jnobs at 127.0.0.1:49152. Is the app running?'));
+        }
+
+        function populateProfiles(profiles, activeProfile) {
+            const current = (actionInfo && actionInfo.payload && actionInfo.payload.settings &&
+                             actionInfo.payload.settings.profileName) || '';
+            profileSelect.innerHTML = '';
+            if (!profiles || profiles.length === 0) {
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = '(no profiles — save one in Jnobs Console)';
+                profileSelect.appendChild(opt);
+                return;
+            }
+            const blank = document.createElement('option');
+            blank.value = '';
+            blank.textContent = '— pick a profile —';
+            profileSelect.appendChild(blank);
+            for (const p of profiles) {
+                const opt = document.createElement('option');
+                opt.value = p;
+                opt.textContent = p + (p === activeProfile ? '  ●' : '');
+                if (p === current) opt.selected = true;
+                profileSelect.appendChild(opt);
+            }
+        }
+
+        function showError(msg) {
+            errorEl.textContent = msg;
+            errorEl.style.display = 'block';
+        }
+
+        profileSelect.addEventListener('change', () => {
+            const settings = { profileName: profileSelect.value };
+            websocket.send(JSON.stringify({
+                event: 'setSettings',
+                context: context,
+                payload: settings
+            }));
+        });
+
+        document.getElementById('refresh').addEventListener('click', fetchProfiles);
+    </script>
+</body>
+</html>

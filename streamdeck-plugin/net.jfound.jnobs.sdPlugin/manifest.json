@@ -1,0 +1,55 @@
+{
+    "Name": "Jnobs",
+    "Description": "Switch Jnobs profiles and trigger actions from your Stream Deck. Requires Jnobs running on the same Mac.",
+    "Author": "JFound",
+    "Version": "1.0.0",
+    "URL": "https://jfound.net",
+    "SDKVersion": 2,
+    "Software": { "MinimumVersion": "6.0" },
+    "OS": [{ "Platform": "mac", "MinimumVersion": "11" }],
+    "Icon": "images/pluginIcon",
+    "Category": "Jnobs",
+    "CategoryIcon": "images/categoryIcon",
+    "CodePath": "plugin.html",
+    "Actions": [
+        {
+            "Name": "Switch Profile",
+            "UUID": "net.jfound.jnobs.switchprofile",
+            "Icon": "images/action",
+            "States": [
+                { "Image": "images/action",        "TitleAlignment": "bottom", "FontSize": "12" },
+                { "Image": "images/action-active", "TitleAlignment": "bottom", "FontSize": "12" }
+            ],
+            "Tooltip": "Switches Jnobs to the chosen profile. Highlights when active.",
+            "PropertyInspectorPath": "property_inspector/switchProfile.html",
+            "SupportedInMultiActions": true
+        },
+        {
+            "Name": "Cycle Profile",
+            "UUID": "net.jfound.jnobs.cycleprofile",
+            "Icon": "images/cycle",
+            "States": [{ "Image": "images/cycle", "TitleAlignment": "bottom" }],
+            "Tooltip": "Cycles to next or previous Jnobs profile.",
+            "PropertyInspectorPath": "property_inspector/cycleProfile.html",
+            "SupportedInMultiActions": true
+        },
+        {
+            "Name": "Toggle Mic Mute",
+            "UUID": "net.jfound.jnobs.togglemicmute",
+            "Icon": "images/mic",
+            "States": [
+                { "Image": "images/mic",        "TitleAlignment": "bottom" },
+                { "Image": "images/mic-muted",  "TitleAlignment": "bottom" }
+            ],
+            "Tooltip": "Toggles the system mic mute via Jnobs."
+        },
+        {
+            "Name": "Fire Button",
+            "UUID": "net.jfound.jnobs.firebutton",
+            "Icon": "images/button",
+            "States": [{ "Image": "images/button", "TitleAlignment": "bottom" }],
+            "Tooltip": "Triggers the short-tap action of Jnobs button N (0–4).",
+            "PropertyInspectorPath": "property_inspector/fireButton.html"
+        }
+    ]
+}
