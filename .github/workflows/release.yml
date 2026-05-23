@@ -1,17 +1,18 @@
 name: Release
 
-# Builds, code-signs (Developer ID), notarizes, staples, and publishes
-# Jnobs.app to a GitHub Release whenever a tag matching v* is pushed.
+# Builds, Developer-ID-signs, notarizes (via App Store Connect API key),
+# staples, zips, and publishes Jnobs.app to a GitHub Release.
 #
-# Required repository secrets (Settings → Secrets and variables → Actions):
-#   MACOS_CERTIFICATE        base64-encoded .p12 of the Developer ID Application cert
-#   MACOS_CERTIFICATE_PWD    password for the .p12
-#   MACOS_CI_KEYCHAIN_PWD    any random string (creates a temp keychain in CI)
-#   APPLE_DEVELOPER_ID       full signing identity, e.g.
-#                            "Developer ID Application: Your Name (TEAMID)"
-#   APPLE_ID                 Apple ID email used for notarization submission
-#   APPLE_APP_PWD            app-specific password from appleid.apple.com
-#   APPLE_TEAM_ID            10-character Team ID (visible in your developer account)
+# Triggers on any tag matching v* (e.g. v1.0.0), or manual workflow_dispatch.
+#
+# Required repository secrets (same names + flow as the Iason streamer
+# release pipeline, so the same 6 values work here):
+#   MAC_CERT_P12_BASE64       base64 of Developer ID Application .p12
+#   MAC_CERT_PASSWORD         password set when exporting the .p12
+#   APPLE_API_KEY_P8_BASE64   base64 of the App Store Connect .p8 private key
+#   APPLE_API_KEY_ID          ASC API Key ID
+#   APPLE_API_ISSUER          ASC Issuer ID
+#   APPLE_TEAM_ID             10-character Apple Team ID
 
 on:
   push:
@@ -19,86 +20,144 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # to create the GitHub Release
+  contents: write   # to create the GitHub Release
 
 jobs:
   release:
+    name: build · sign · notarize · publish
     runs-on: macos-15
+    timeout-minutes: 35
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode.app
 
-      - name: Import Developer ID certificate into temporary keychain
+      # --- Import Developer ID cert into a fresh, ephemeral keychain ---
+      # Dies with the runner; never touches the login keychain.
+      - name: Import Developer ID certificate
         env:
-          MACOS_CERTIFICATE:     ${{ secrets.MACOS_CERTIFICATE }}
-          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
-          KEYCHAIN_PWD:          ${{ secrets.MACOS_CI_KEYCHAIN_PWD }}
+          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD:   ${{ secrets.MAC_CERT_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "$MACOS_CERTIFICATE" | base64 --decode > /tmp/cert.p12
-          security create-keychain -p "$KEYCHAIN_PWD" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "$KEYCHAIN_PWD" build.keychain
-          security set-keychain-settings -t 3600 -u build.keychain
-          security import /tmp/cert.p12 \
-            -k build.keychain \
-            -P "$MACOS_CERTIFICATE_PWD" \
-            -T /usr/bin/codesign \
-            -T /usr/bin/security
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN
+          security set-keychain-settings -lut 21600 $KEYCHAIN
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN
+
+          echo "$MAC_CERT_P12_BASE64" | base64 --decode > /tmp/cert.p12
+          security import /tmp/cert.p12 -k $KEYCHAIN \
+            -P "$MAC_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f /tmp/cert.p12
+
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PWD" build.keychain
-          rm /tmp/cert.p12
+            -s -k "$KEYCHAIN_PASSWORD" $KEYCHAIN
 
+          security list-keychains -d user -s $KEYCHAIN login.keychain
+          security default-keychain -s $KEYCHAIN
+
+          echo "Identities in build keychain:"
+          security find-identity -p codesigning -v $KEYCHAIN
+
+      # --- Stage the App Store Connect API .p8 for notarytool ---
+      - name: Stage ASC API key
+        env:
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID:        ${{ secrets.APPLE_API_KEY_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode \
+            > ~/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+          chmod 600 ~/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8
+
+      # --- Build (build_app.sh ad-hoc signs; we re-sign with Developer ID next) ---
       - name: Build app
         working-directory: app
         run: ./build_app.sh --release
 
-      - name: Re-sign with Developer ID + hardened runtime
-        env:
-          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+      # --- Re-sign with Developer ID + hardened runtime + secure timestamp ---
+      # Identity is derived from the keychain at runtime so no extra secret
+      # is needed beyond the cert itself.
+      - name: Re-sign with Developer ID
         run: |
           set -euo pipefail
           APP="app/Jnobs.app"
-          # Build script ad-hoc signs; replace with Developer ID + hardened
-          # runtime + secure timestamp (all required for notarization).
+          IDENTITY="$(security find-identity -p codesigning -v build.keychain \
+            | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity found in build keychain"
+            security find-identity -p codesigning -v build.keychain
+            exit 1
+          fi
+          echo "Signing with: $IDENTITY"
           codesign --force --deep \
             --options runtime \
             --timestamp \
-            --sign "$APPLE_DEVELOPER_ID" \
+            --sign "$IDENTITY" \
             "$APP"
-          codesign --verify --strict --verbose=2 "$APP"
 
+      # --- Zip + submit to Apple's notary service ---
       - name: Zip for notarization
-        run: |
-          ditto -c -k --keepParent app/Jnobs.app /tmp/Jnobs.zip
+        run: ditto -c -k --keepParent app/Jnobs.app /tmp/Jnobs.zip
 
-      - name: Submit to Apple notary service
+      - name: Notarize via App Store Connect API
+        timeout-minutes: 25
         env:
-          APPLE_ID:       ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID:  ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PWD:  ${{ secrets.APPLE_APP_PWD }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
           set -euo pipefail
           xcrun notarytool submit /tmp/Jnobs.zip \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_PWD" \
+            --key ~/.appstoreconnect/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8 \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" \
             --wait
 
       - name: Staple notarization ticket
         run: xcrun stapler staple app/Jnobs.app
 
-      - name: Re-zip stapled app for release
+      # Re-zip the now-stapled .app so users get an offline-verifiable bundle.
+      - name: Re-zip stapled app
         run: |
-          rm /tmp/Jnobs.zip
+          rm -f /tmp/Jnobs.zip
           ditto -c -k --keepParent app/Jnobs.app /tmp/Jnobs.zip
 
-      - name: Verify Gatekeeper acceptance
-        run: spctl -a -t exec -vv app/Jnobs.app
+      # --- Apple's prescribed verification chain ---
+      - name: Verify per Apple's notarization rules
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          APP="app/Jnobs.app"
 
+          echo "--- codesign --verify --deep --strict ---"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          echo "--- codesign -dvvv ---"
+          codesign -dvvv "$APP" 2>&1 | tee /tmp/csinfo.txt
+          grep -q "TeamIdentifier=${APPLE_TEAM_ID}" /tmp/csinfo.txt \
+            || { echo "TeamIdentifier mismatch — want ${APPLE_TEAM_ID}"; exit 1; }
+          grep -q "flags=0x10000(runtime)" /tmp/csinfo.txt \
+            || { echo "Hardened Runtime not enabled"; exit 1; }
+          grep -q "Authority=Developer ID Application" /tmp/csinfo.txt \
+            || { echo "Wrong signing authority"; exit 1; }
+
+          echo "--- spctl --assess (Gatekeeper) ---"
+          spctl --assess -vv --type execute "$APP"
+
+          echo "--- stapler validate ---"
+          xcrun stapler validate -v "$APP"
+
+          echo "--- ALL APPLE CHECKS PASSED ---"
+
+      # --- Publish to GitHub Releases ---
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
