@@ -17,6 +17,26 @@ final class LEDRenderer: ObservableObject {
     private var animationTick: Double = 0   // for rainbow / pulse effects
     private var timer: Timer?
 
+    /// Per-knob per-LED ON/OFF latch for positionFill hysteresis. Without
+    /// this, a fillRatio that hovers near a threshold (very common in
+    /// VU-meter mode on game audio) flickers the LED at that boundary
+    /// every frame. Hysteresis: turn ON at the normal threshold, turn OFF
+    /// only when the value drops 5% below it.
+    private var positionFillLit: [[Bool]] = Array(
+        repeating: Array(repeating: false, count: TUProtocol.ledsPerKnob),
+        count: TUProtocol.knobCount
+    )
+
+    /// Per-knob smoothed VU fillRatio. Real VU meters have fast attack
+    /// and slow release so spikes register but the needle doesn't twitch;
+    /// without this the raw RMS swings 30%+ frame-to-frame on bursty game
+    /// audio and overwhelms any reasonable hysteresis band. Tuned for
+    /// ~200 ms visual release at the 30 Hz tick.
+    private var smoothedFill: [Double] = Array(
+        repeating: 0,
+        count: TUProtocol.knobCount
+    )
+
     init(deviceManager: DeviceManager, router: ActionRouter) {
         self.deviceManager = deviceManager
         self.router = router
@@ -68,7 +88,24 @@ final class LEDRenderer: ObservableObject {
            !bid.isEmpty,
            let state = router.tapRouter.states[bid],
            state.status == .built {
-            fillRatio = Double(sqrtf(state.level))
+            // Sqrt-shape because RMS is power-ish and perceived loudness
+            // is log-ish — keeps the fan reactive without sitting near 0.
+            var raw = Double(sqrtf(state.level))
+            // Noise gate: SRC stage + tiny digital noise floor ~0.01-0.02
+            // even on silence; snap below that to 0 so the first LED isn't
+            // perpetually twitching at ambient.
+            if raw < 0.03 { raw = 0 }
+            // VU ballistics: fast attack (rise instantly to peak), slow
+            // release (0.85 per 30 Hz frame ≈ 200 ms time constant).
+            let prev = smoothedFill[i]
+            let smoothed = max(raw, prev * 0.85)
+            smoothedFill[i] = smoothed
+            fillRatio = smoothed
+        } else if i < smoothedFill.count {
+            // Knob not in VU mode this tick — reset smoothing so a future
+            // re-bind to .appVolume starts clean instead of decaying from
+            // a stale value.
+            smoothedFill[i] = 0
         }
 
         switch binding {
@@ -82,11 +119,16 @@ final class LEDRenderer: ObservableObject {
         case .positionFill(let c):
             // Each LED segment is fully on if the value reaches it, else a
             // dim "track" so the fan always reads as alive. For VU-meter
-            // mode (appVolume knob), the value is the live RMS level.
+            // mode (appVolume knob), the value is the live RMS level — and
+            // we apply hysteresis so a level hovering near a threshold
+            // doesn't flicker the LED at that boundary (per-frame on/off).
             var arr: [RGB] = []
             for j in 0..<leds {
-                let threshold = Double(j + 1) / Double(leds)
-                let lit = fillRatio >= threshold - 0.5 / Double(leds)
+                let onThreshold  = Double(j + 1) / Double(leds) - 0.5 / Double(leds)
+                let offThreshold = onThreshold - 0.05
+                let wasLit = positionFillLit[i][j]
+                let lit = wasLit ? (fillRatio > offThreshold) : (fillRatio >= onThreshold)
+                positionFillLit[i][j] = lit
                 let scale = lit ? bright : bright * 0.18
                 arr.append(c.scaled(scale).gammaCorrected())
             }

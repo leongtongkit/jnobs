@@ -59,6 +59,19 @@ final class SerialPort: @unchecked Sendable {
 
     var isOpen: Bool { fd >= 0 }
 
+    /// Re-assert DTR + RTS. Called periodically by the keepalive watchdog —
+    /// macOS power management has been observed to silently drop modem lines
+    /// during long idle, which makes the Turn Up firmware fall silent
+    /// (same root cause as the open-time gotcha; this just re-applies it).
+    /// Microseconds-cheap ioctl on an open port; no-op if closed.
+    func reassertModemLines() {
+        queue.async { [weak self] in
+            guard let self, self.fd >= 0 else { return }
+            var bits: Int32 = TIOCM_DTR | TIOCM_RTS
+            _ = ioctl(self.fd, TIOCMBIS, &bits)
+        }
+    }
+
     /// Write a frame. Best-effort, funneled through the serial queue. Briefly
     /// polls for writability so a momentarily-full TX buffer doesn't drop data,
     /// but never blocks indefinitely.

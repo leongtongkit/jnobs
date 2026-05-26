@@ -21,7 +21,9 @@ import os
 /// updated at ~30 Hz from each IOProc.
 @MainActor
 final class TapRouter: ObservableObject {
-    private let log = Logger(subsystem: "net.jfound.jnobs", category: "TapRouter")
+    // nonisolated so the off-main build path (see tryBuild → buildRoute) can
+    // log without bouncing back to main just to emit a line.
+    private nonisolated let log = Logger(subsystem: "net.jfound.jnobs", category: "TapRouter")
 
     // MARK: - Public state
 
@@ -33,7 +35,10 @@ final class TapRouter: ObservableObject {
     // MARK: - Internal state
 
     /// One live route per controlled app (keyed by bundle ID).
-    private final class Route {
+    /// `@unchecked Sendable`: pointers are heap-allocated, lifecycle owned by
+    /// TapRouter, and the IOProc is the only RT-thread writer of levelPtr.
+    /// Built on a background queue (off-main) and handed to MainActor once.
+    private final class Route: @unchecked Sendable {
         let bundleID: String
         var outputUID: String?            // nil = follow system default output
         var tapID: AudioObjectID = 0
@@ -73,6 +78,11 @@ final class TapRouter: ObservableObject {
     private var deviceListenerInstalled = false
     private var sleepWakeRegistered = false
     private var levelTimer: Timer?
+    /// Bundles whose `buildRoute` is currently running on a background queue.
+    /// Prevents the device-list / process-list listeners from queueing a
+    /// duplicate build while one is in flight (would otherwise pile up
+    /// dozens of concurrent CoreAudio calls when notifications storm).
+    private var buildingBundles: Set<String> = []
 
     init() {
         installProcessListListener()
@@ -168,11 +178,36 @@ final class TapRouter: ObservableObject {
 
     private func tryBuild(bundleID: String) {
         guard let w = wanted[bundleID] else { return }
+        // De-dupe in-flight builds. Without this, the device-list listener
+        // (which fires whenever we create our own aggregate) would queue a
+        // second handleDeviceListChange while the first build is still
+        // running on a background thread — racing on routes[bid] and pinning
+        // CoreAudio. Symptom seen 2026-05-24 with Hearthstone: main thread
+        // wedged inside AudioHardwareCreateAggregateDevice for tens of
+        // seconds, UI frozen, LEDs dark.
+        guard !buildingBundles.contains(bundleID) else { return }
         let effectiveGain: Float = w.muted ? 0 : w.gain
-        if let r = buildRoute(bundleID: bundleID, gain: effectiveGain, outputUID: w.outputUID) {
-            routes[bundleID] = r
-        }
+        let outputUID = w.outputUID
+        buildingBundles.insert(bundleID)
         publishState(bundleID)
+        Task { [weak self] in
+            // CoreAudio aggregate/tap creation runs sync IPC that can block
+            // for many seconds; we cannot afford to hold the main thread.
+            let route: Route? = await Task.detached(priority: .userInitiated) { [weak self] in
+                self?.buildRoute(bundleID: bundleID, gain: effectiveGain, outputUID: outputUID)
+            }.value
+            guard let self else { return }
+            self.buildingBundles.remove(bundleID)
+            if let r = route {
+                self.routes[bundleID] = r
+                // The user may have changed volume while the build was in
+                // flight; re-apply the current wanted gain so the freshly-
+                // built route reflects today's state, not the snapshot we
+                // captured when the build started.
+                self.applyGainToRoute(bundleID)
+            }
+            self.publishState(bundleID)
+        }
     }
 
     private func applyGainToRoute(_ bundleID: String) {
@@ -344,15 +379,19 @@ final class TapRouter: ObservableObject {
     }
 
     private func refreshLevels() {
+        // Read-only publisher. The IOProc's per-buffer peak-hold
+        // (`max(rms, prev * 0.92)`) is the authoritative decay path. Writing
+        // back to `levelPtr` from here used to flicker the VU meter
+        // because the two decay rates fought each other (IOProc trying to
+        // hold, timer trying to drop, so the level oscillated even on
+        // steady audio). The IOProc keeps firing on the aggregate device
+        // even when the tapped app is silent, so the peak-hold handles
+        // silence on its own.
         var changed = false
         for (bid, r) in routes {
             let lvl = r.levelPtr.pointee
-            // Apply a tiny decay so the meter falls when audio stops, even
-            // if the IOProc isn't firing (e.g., app silent but route alive).
-            let decayed = max(0, lvl * 0.85)
-            r.levelPtr.pointee = decayed
-            if var s = states[bid], abs(s.level - decayed) > 0.001 {
-                s.level = decayed
+            if var s = states[bid], abs(s.level - lvl) > 0.001 {
+                s.level = lvl
                 states[bid] = s
                 changed = true
             }
@@ -362,7 +401,11 @@ final class TapRouter: ObservableObject {
 
     // MARK: - Route construction
 
-    private func buildRoute(bundleID: String, gain: Float, outputUID: String?) -> Route? {
+    /// nonisolated — invoked from a background `Task.detached` (see
+    /// `tryBuild`) so the sync CoreAudio IPC inside doesn't pin the main
+    /// thread. Touches no MainActor-isolated state; DiagSink writes are
+    /// bounced back to MainActor.
+    nonisolated private func buildRoute(bundleID: String, gain: Float, outputUID: String?) -> Route? {
         let procIDs = AudioProcesses.objectIDs(forBundleID: bundleID)
         guard !procIDs.isEmpty else {
             log.info("no audio processes for \(bundleID, privacy: .public) yet; will retry when it plays")
@@ -395,7 +438,9 @@ final class TapRouter: ObservableObject {
         guard tapStatus == noErr,
               let tapUID = CA.string(tapID, CA.addr(kAudioTapPropertyUID)) else {
             log.error("tap creation failed for \(bundleID, privacy: .public): OSStatus=\(tapStatus)")
-            DiagSink.shared.error("TapRouter", "tap creation failed for \(bundleID): OSStatus=\(tapStatus)")
+            Task { @MainActor in
+                DiagSink.shared.error("TapRouter", "tap creation failed for \(bundleID): OSStatus=\(tapStatus)")
+            }
             return nil
         }
 
@@ -424,7 +469,9 @@ final class TapRouter: ObservableObject {
         let aggStatus = AudioHardwareCreateAggregateDevice(aggDict as CFDictionary, &aggID)
         guard aggStatus == noErr else {
             log.error("aggregate creation failed for \(bundleID, privacy: .public): OSStatus=\(aggStatus) aggUID=\(aggUID, privacy: .public)")
-            DiagSink.shared.error("TapRouter", "aggregate creation failed for \(bundleID): OSStatus=\(aggStatus)")
+            Task { @MainActor in
+                DiagSink.shared.error("TapRouter", "aggregate creation failed for \(bundleID): OSStatus=\(aggStatus)")
+            }
             AudioHardwareDestroyProcessTap(tapID)
             return nil
         }
@@ -481,7 +528,9 @@ final class TapRouter: ObservableObject {
         route.ioProcID = proc
         AudioDeviceStart(aggID, proc)
         log.info("route up: \(bundleID, privacy: .public) → \(outUID, privacy: .public) gain \(gain)")
-        DiagSink.shared.info("TapRouter", "route up: \(bundleID) → \(outUID) gain=\(String(format: "%.2f", gain))")
+        Task { @MainActor in
+            DiagSink.shared.info("TapRouter", "route up: \(bundleID) → \(outUID) gain=\(String(format: "%.2f", gain))")
+        }
         return route
     }
 

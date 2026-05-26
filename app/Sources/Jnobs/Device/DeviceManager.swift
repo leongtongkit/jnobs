@@ -103,9 +103,23 @@ final class DeviceManager: ObservableObject {
         let t = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                if Date().timeIntervalSince(self.lastHealth) > 10 {
-                    self.log.warning("no heartbeat in 10s; reconnecting")
-                    self.handleDisconnect(reason: "heartbeat lost")
+                // Defensive re-arm every tick. macOS PM has been observed
+                // to silently drop modem lines during long idle, which
+                // makes the Turn Up firmware fall silent. Microseconds-
+                // cheap; no point gating on silence.
+                self.port?.reassertModemLines()
+                let silence = Date().timeIntervalSince(self.lastHealth)
+                if silence > 12 {
+                    // Truly gone — even the recovery ping didn't help.
+                    self.log.warning("no heartbeat in \(Int(silence))s; reconnecting")
+                    self.handleDisconnect(reason: "heartbeat lost (\(Int(silence))s)")
+                } else if silence > 5 {
+                    // Soft recovery before nuclear teardown. The device
+                    // responds to `fe 01 ff` with deviceID + knob batch
+                    // and resumes its 500 ms heartbeat. If silence persists
+                    // past 12s, the next tick will tear down.
+                    self.log.info("no heartbeat in \(Int(silence))s; recovery ping")
+                    self.port?.write(FrameEncoder.ping())
                 }
             }
         }
